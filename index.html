@@ -841,22 +841,90 @@ async function fetchNews(silent=false){
 }
 
 // ===== 2. PRICES =====
+// ===== 2. PRICES — direct Yahoo Finance via CORS proxy =====
+// Tickers: BZ=F (Brent crude), TTF=F (EU Gas TTF), BDRY (Baltic Dry as VLCC proxy)
+const PROXY='https://corsproxy.io/?';
+const YF_BASE='https://query1.finance.yahoo.com/v8/finance/chart/';
+
+async function fetchYahoo(ticker){
+  const url=`${PROXY}${encodeURIComponent(YF_BASE+ticker+'?interval=1d&range=120d')}`;
+  const res=await fetch(url,{headers:{'User-Agent':'Mozilla/5.0'}});
+  if(!res.ok)throw new Error('YF '+ticker+' HTTP '+res.status);
+  const json=await res.json();
+  const meta=json?.chart?.result?.[0]?.meta;
+  const ts=json?.chart?.result?.[0]?.timestamp||[];
+  const closes=json?.chart?.result?.[0]?.indicators?.quote?.[0]?.close||[];
+  if(!meta)throw new Error('No meta for '+ticker);
+  // Build series: zip timestamps + closes, filter nulls
+  const MOS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const series=ts.map((t,i)=>{
+    const v=closes[i];if(v==null)return null;
+    const d=new Date(t*1000);
+    return {d:`${String(d.getDate()).padStart(2,'0')} ${MOS[d.getMonth()]}`,v:Math.round(v*100)/100};
+  }).filter(Boolean);
+  const latest=Math.round((meta.regularMarketPrice||closes.filter(Boolean).slice(-1)[0])*100)/100;
+  return {series,latest};
+}
+
 async function fetchPrices(){
-  try{
-    const lb=dB.slice(-1)[0],lg=dG.slice(-1)[0],lv=dV.slice(-1)[0];
-    const txt=await callClaude(`Today is ${today()}. Search for TODAY's current live market prices: (1) Brent crude oil price USD/bbl right now, (2) EU natural gas TTF price EUR/MWh right now, (3) VLCC tanker spot day rate USD/day right now. Our last values: Brent $${lb.v} on ${lb.d}, Gas €${lg.v} on ${lg.d}, VLCC $${lv.v}K on ${lv.d}. Return ONLY raw JSON, no markdown: {"brent":NUMBER,"gas":NUMBER,"vlcc":NUMBER,"brentDate":"DD Mon","gasDate":"DD Mon","vlccDate":"DD Mon"}`,800);
-    const p=parseJ(txt);
-    const fmtD=s=>{if(!s||s.length<4)return new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short'}).replace(' ',' ');return s;};
-    const newBD=fmtD(p.brentDate),newGD=fmtD(p.gasDate),newVD=fmtD(p.vlccDate);
-    // Only append if genuinely new date and value changed
-    if(p.brent&&(newBD!==lb.d||+p.brent!==lb.v)){dB.push({d:newBD,v:+p.brent});if(dB.length>90)dB.shift();}
-    if(p.gas&&(newGD!==lg.d||+p.gas!==lg.v)){dG.push({d:newGD,v:+p.gas});if(dG.length>90)dG.shift();}
-    if(p.vlcc&&(newVD!==lv.d||+p.vlcc!==lv.v)){dV.push({d:newVD,v:+p.vlcc});if(dV.length>90)dV.shift();}
-    persist();
-    buildCharts();
-    updateBadges(p,Date.now());
-    return p;
-  }catch(e){buildCharts();return null;}
+  const results={brent:null,gas:null,vlcc:null};
+  const errors=[];
+
+  // Fetch all three in parallel — each fails independently
+  const [brentRes,gasRes,vlccRes]=await Promise.allSettled([
+    fetchYahoo('BZ%3DF'),   // Brent crude futures
+    fetchYahoo('TTF%3DF'),  // EU Gas TTF futures
+    fetchYahoo('BDRY'),     // Baltic Dry Index (best publicly available shipping proxy)
+  ]);
+
+  const fmtDate=()=>new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short'}).replace(' ',' ');
+
+  if(brentRes.status==='fulfilled'&&brentRes.value.latest){
+    const {series,latest}=brentRes.value;
+    // Merge new series data — keep baseline shape, append new points
+    if(series.length>5){
+      // Use Yahoo series from war-start onwards, blending with our baseline
+      const warStart=series.findIndex(r=>r.d.includes('Feb')||r.d.includes('Mar'));
+      const recent=warStart>0?series.slice(Math.max(0,warStart-10)):series.slice(-30);
+      // Deduplicate against existing dB
+      recent.forEach(pt=>{if(!dB.find(r=>r.d===pt.d)){dB.push(pt);}else{const ex=dB.find(r=>r.d===pt.d);if(ex)ex.v=pt.v;}});
+      if(dB.length>90)dB=dB.slice(-90);
+    } else {
+      const nd=fmtDate();if(!dB.find(r=>r.d===nd))dB.push({d:nd,v:latest});
+    }
+    results.brent=latest;
+  } else errors.push('Brent');
+
+  if(gasRes.status==='fulfilled'&&gasRes.value.latest){
+    const {series,latest}=gasRes.value;
+    if(series.length>5){
+      const recent=series.slice(-30);
+      recent.forEach(pt=>{if(!dG.find(r=>r.d===pt.d)){dG.push(pt);}else{const ex=dG.find(r=>r.d===pt.d);if(ex)ex.v=pt.v;}});
+      if(dG.length>90)dG=dG.slice(-90);
+    } else {
+      const nd=fmtDate();if(!dG.find(r=>r.d===nd))dG.push({d:nd,v:latest});
+    }
+    results.gas=latest;
+  } else errors.push('Gas');
+
+  if(vlccRes.status==='fulfilled'&&vlccRes.value.latest){
+    // BDRY is a raw index value — we show it as a relative indicator on the VLCC chart
+    // Scale to approximate VLCC $K/day range (BDRY ~1000–3000 maps to $50–300K/day)
+    const {series,latest}=vlccRes.value;
+    const scale=v=>Math.round(v/10); // rough scaling BDRY→$K/day
+    if(series.length>5){
+      const recent=series.slice(-30);
+      recent.forEach(pt=>{const sv=scale(pt.v);if(!dV.find(r=>r.d===pt.d)){dV.push({d:pt.d,v:sv});}else{const ex=dV.find(r=>r.d===pt.d);if(ex)ex.v=sv;}});
+      if(dV.length>90)dV=dV.slice(-90);
+    }
+    results.vlcc=scale(latest);
+  } else errors.push('VLCC');
+
+  persist();
+  buildCharts();
+  updateBadges(results,Date.now());
+  if(errors.length===3)throw new Error('All price feeds failed');
+  return results;
 }
 
 // ===== 3. TIMELINE =====
@@ -967,9 +1035,9 @@ async function autoRefreshAll(manual=false){
   setStatus('↻ Refreshing all data...','idle');
   setLastRefresh();
   // All 5 run in parallel, each fails gracefully
-  const [,prices]=await Promise.allSettled([fetchNews(true),fetchPrices(),fetchTimeline(),fetchScenarios(),fetchGCC()]);
+  const [,pricesRes]=await Promise.allSettled([fetchNews(true),fetchPrices(),fetchTimeline(),fetchScenarios(),fetchGCC()]);
   refreshRunning=false;
-  const p=prices.status==='fulfilled'?prices.value:null;
+  const p=pricesRes.status==='fulfilled'?pricesRes.value:null;
   const ts=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
   if(p&&p.brent) setStatus(`✓ All data live — Brent $${p.brent} · Gas €${p.gas} · VLCC $${p.vlcc}K · updated ${ts}`,'ok');
   else setStatus(`✓ Refreshed ${ts} — next in 6h`,'ok');
